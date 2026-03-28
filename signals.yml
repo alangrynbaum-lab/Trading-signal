@@ -1,0 +1,74 @@
+name: Trading Bot — Señales Diarias
+
+on:
+  schedule:
+    # Corre de lunes a viernes
+    # 14:35 UTC = 11:35 AM ET (apertura NY + 1h)
+    - cron: "35 14 * * 1-5"
+    # 21:05 UTC = 18:05 ET (cierre NY + 35min)
+    - cron: "05 21 * * 1-5"
+
+  # Permite correrlo manualmente desde GitHub Actions
+  workflow_dispatch:
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Correr scanner de señales
+        env:
+          # Estos secrets los configurás en:
+          # GitHub repo → Settings → Secrets and variables → Actions
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python signals.py
+
+  # Job separado: backtest semanal (domingos a las 10 UTC)
+  backtest_weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 10 * * 0'
+
+    on:
+      schedule:
+        - cron: "0 10 * * 0"
+      workflow_dispatch:
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          mkdir -p results
+
+      - name: Correr backtesting
+        run: python backtester.py
+
+      - name: Subir resultados como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30
