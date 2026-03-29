@@ -16,6 +16,11 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
+# Simular browser para evitar bloqueos de Yahoo Finance en CI
+yf.utils.user_agent_headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
 
 def load_config(path: str = "config.json") -> dict:
     with open(path) as f:
@@ -34,20 +39,28 @@ def send_telegram(token: str, chat_id: str, message: str):
 
 
 def fetch_data(ticker: str, retries: int = 3) -> pd.DataFrame:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+
     for attempt in range(retries):
         try:
-            time.sleep(2)
-            tk = yf.Ticker(ticker)
+            time.sleep(3 + attempt * 2)
+            tk = yf.Ticker(ticker, session=session)
             df = tk.history(period="120d", interval="1d", auto_adjust=True)
             if df.empty:
-                raise ValueError(f"No data for {ticker}")
+                raise ValueError(f"DataFrame vacío para {ticker}")
             df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
             df.index = pd.to_datetime(df.index).tz_localize(None)
+            print(f"    ✓ {len(df)} filas descargadas")
             return df
         except Exception as e:
             print(f"    Intento {attempt+1}/{retries} fallido: {e}")
             if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
+                time.sleep(10)
     raise ValueError(f"No se pudo obtener datos para {ticker}")
 
 
@@ -97,15 +110,13 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
     elif rsi > 60:
         score += 1
 
-    macd_cross_up   = last["macd"] > last["macd_sig"] and prev["macd"] <= prev["macd_sig"]
-    macd_cross_down = last["macd"] < last["macd_sig"] and prev["macd"] >= prev["macd_sig"]
-    macd_bull       = last["macd"] > last["macd_sig"]
-    macd_hist_grow  = last["macd_hist"] > prev["macd_hist"]
+    macd_bull      = last["macd"] > last["macd_sig"]
+    macd_hist_grow = last["macd_hist"] > prev["macd_hist"]
 
-    if macd_cross_up:
+    if last["macd"] > last["macd_sig"] and prev["macd"] <= prev["macd_sig"]:
         signals.append("📈 MACD cruzó arriba signal line (Bullish)")
         score += 2
-    elif macd_cross_down:
+    elif last["macd"] < last["macd_sig"] and prev["macd"] >= prev["macd_sig"]:
         signals.append("📉 MACD cruzó abajo signal line (Bearish)")
         score -= 2
     elif macd_bull and macd_hist_grow:
@@ -118,20 +129,17 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
         signals.append(f"🔊 Spike de volumen {direction} ({vol_ratio:.1f}x promedio)")
         score += 1 if direction == "alcista" else -1
 
-    confluence_bull = ema_bull and macd_bull and rsi < p["rsi_overbought"] and bool(last["vol_spike"])
-    confluence_bear = not ema_bull and not macd_bull and rsi > p["rsi_oversold"]
-
-    if confluence_bull:
+    if ema_bull and macd_bull and rsi < p["rsi_overbought"] and bool(last["vol_spike"]):
         signals.append("⭐ CONFLUENCIA BULLISH: EMA + MACD + Volumen alineados")
         score += 2
-    elif confluence_bear:
+    elif not ema_bull and not macd_bull and rsi > p["rsi_oversold"]:
         signals.append("⭐ CONFLUENCIA BEARISH: EMA + MACD + RSI alineados")
         score -= 2
 
     daily_chg = (float(last["Close"]) - float(prev["Close"])) / float(prev["Close"]) * 100
 
-    if score >= 4:   verdict = "🟢 COMPRA FUERTE"
-    elif score >= 2: verdict = "🟡 SEÑAL DE COMPRA"
+    if score >= 4:    verdict = "🟢 COMPRA FUERTE"
+    elif score >= 2:  verdict = "🟡 SEÑAL DE COMPRA"
     elif score <= -4: verdict = "🔴 VENTA FUERTE"
     elif score <= -2: verdict = "🟠 SEÑAL DE VENTA"
     else:             verdict = "⚪ NEUTRAL"
