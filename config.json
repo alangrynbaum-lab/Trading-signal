@@ -1,10 +1,10 @@
 {
-"tickers": ["SPY", "GLD", "ARKW", "VGT", "XLE", "SCHD", "MSTR", "BTC-USD", "ARGT"]
+  "tickers": ["SPY", "GLD", "ARKW", "VGT", "XLE", "SCHD", "MSTR", "BTC-USD", "ARGT"],
   "timeframe": "1d",
   "lookback_days": 365,
   "telegram": {
-    "bot_token": "YOUR_BOT_TOKEN",
-    "chat_id": "YOUR_CHAT_ID"
+    "bot_token": "",
+    "chat_id": ""
   },
   "strategy_params": {
     "ema_fast": 20,
