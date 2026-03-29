@@ -5,6 +5,7 @@ Corre diariamente via GitHub Actions y manda alertas a Telegram.
 
 import json
 import os
+import time
 import warnings
 from datetime import datetime
 
@@ -27,22 +28,33 @@ def send_telegram(token: str, chat_id: str, message: str):
     try:
         r = requests.post(url, data=data, timeout=10)
         r.raise_for_status()
+        print(f"    → Telegram OK")
     except Exception as e:
         print(f"  ⚠️  Telegram error: {e}")
 
 
-def fetch_data(ticker: str) -> pd.DataFrame:
-    df = yf.download(ticker, period="120d", interval="1d", auto_adjust=True, progress=False)
-    if df.empty:
-        raise ValueError(f"No data for {ticker}")
-    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+def fetch_data(ticker: str, retries: int = 3) -> pd.DataFrame:
+    for attempt in range(retries):
+        try:
+            time.sleep(2)
+            tk = yf.Ticker(ticker)
+            df = tk.history(period="120d", interval="1d", auto_adjust=True)
+            if df.empty:
+                raise ValueError(f"No data for {ticker}")
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            return df
+        except Exception as e:
+            print(f"    Intento {attempt+1}/{retries} fallido: {e}")
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    raise ValueError(f"No se pudo obtener datos para {ticker}")
 
 
 def add_indicators(df: pd.DataFrame, p: dict) -> pd.DataFrame:
-    df = df.copy()
-    close  = df["Close"]
-    volume = df["Volume"]
+    df     = df.copy()
+    close  = df["Close"].squeeze()
+    volume = df["Volume"].squeeze()
     df["ema_fast"]  = ta.trend.ema_indicator(close, window=p["ema_fast"])
     df["ema_slow"]  = ta.trend.ema_indicator(close, window=p["ema_slow"])
     df["rsi"]       = ta.momentum.rsi(close, window=p["rsi_period"])
@@ -59,13 +71,12 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
     last  = df.iloc[-1]
     prev  = df.iloc[-2]
     price = float(last["Close"])
-
     signals = []
     score   = 0
 
-    ema_bull       = last["ema_fast"] > last["ema_slow"]
     ema_cross_up   = last["ema_fast"] > last["ema_slow"] and prev["ema_fast"] <= prev["ema_slow"]
     ema_cross_down = last["ema_fast"] < last["ema_slow"] and prev["ema_fast"] >= prev["ema_slow"]
+    ema_bull       = last["ema_fast"] > last["ema_slow"]
 
     if ema_cross_up:
         signals.append("📈 EMA20 cruzó arriba EMA50 (Bullish crossover)")
@@ -86,9 +97,9 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
     elif rsi > 60:
         score += 1
 
-    macd_bull       = last["macd"] > last["macd_sig"]
     macd_cross_up   = last["macd"] > last["macd_sig"] and prev["macd"] <= prev["macd_sig"]
     macd_cross_down = last["macd"] < last["macd_sig"] and prev["macd"] >= prev["macd_sig"]
+    macd_bull       = last["macd"] > last["macd_sig"]
     macd_hist_grow  = last["macd_hist"] > prev["macd_hist"]
 
     if macd_cross_up:
@@ -107,10 +118,13 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
         signals.append(f"🔊 Spike de volumen {direction} ({vol_ratio:.1f}x promedio)")
         score += 1 if direction == "alcista" else -1
 
-    if ema_bull and macd_bull and rsi < p["rsi_overbought"] and bool(last["vol_spike"]):
+    confluence_bull = ema_bull and macd_bull and rsi < p["rsi_overbought"] and bool(last["vol_spike"])
+    confluence_bear = not ema_bull and not macd_bull and rsi > p["rsi_oversold"]
+
+    if confluence_bull:
         signals.append("⭐ CONFLUENCIA BULLISH: EMA + MACD + Volumen alineados")
         score += 2
-    elif not ema_bull and not macd_bull and rsi > p["rsi_oversold"]:
+    elif confluence_bear:
         signals.append("⭐ CONFLUENCIA BEARISH: EMA + MACD + RSI alineados")
         score -= 2
 
@@ -122,12 +136,10 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
     elif score <= -2: verdict = "🟠 SEÑAL DE VENTA"
     else:             verdict = "⚪ NEUTRAL"
 
-    return {
-        "ticker": ticker, "price": price, "daily_chg": daily_chg,
-        "rsi": rsi, "ema_fast": float(last["ema_fast"]), "ema_slow": float(last["ema_slow"]),
-        "macd": float(last["macd"]), "macd_sig": float(last["macd_sig"]),
-        "vol_spike": bool(last["vol_spike"]), "signals": signals, "score": score, "verdict": verdict,
-    }
+    return {"ticker": ticker, "price": price, "daily_chg": daily_chg, "rsi": rsi,
+            "ema_fast": float(last["ema_fast"]), "ema_slow": float(last["ema_slow"]),
+            "macd": float(last["macd"]), "macd_sig": float(last["macd_sig"]),
+            "vol_spike": bool(last["vol_spike"]), "signals": signals, "score": score, "verdict": verdict}
 
 
 def format_message(a: dict, date_str: str) -> str:
@@ -136,7 +148,7 @@ def format_message(a: dict, date_str: str) -> str:
         f"<b>🤖 SEÑAL DIARIA — {date_str}</b>",
         f"<b>{a['ticker']}</b>  {emoji} ${a['price']:.2f} ({a['daily_chg']:+.2f}%)",
         "",
-        f"<b>Indicadores:</b>",
+        "<b>Indicadores:</b>",
         f"  RSI: {a['rsi']:.1f}",
         f"  EMA20: {a['ema_fast']:.2f}  |  EMA50: {a['ema_slow']:.2f}",
         f"  MACD: {a['macd']:.3f}  |  Signal: {a['macd_sig']:.3f}",
@@ -151,17 +163,19 @@ def format_message(a: dict, date_str: str) -> str:
 
 
 def format_summary(analyses: list, date_str: str) -> str:
-    buys    = sorted([a for a in analyses if a["score"] >= 2],  key=lambda x: x["score"], reverse=True)
-    sells   = sorted([a for a in analyses if a["score"] <= -2], key=lambda x: x["score"])
+    buys    = [a for a in analyses if a["score"] >= 2]
+    sells   = [a for a in analyses if a["score"] <= -2]
     neutral = [a for a in analyses if -2 < a["score"] < 2]
     lines   = [f"<b>📊 RESUMEN DIARIO — {date_str}</b>", ""]
     if buys:
         lines.append("<b>🟢 Señales de Compra:</b>")
-        lines += [f"  {a['ticker']} — {a['verdict']} (score: {a['score']:+d})" for a in buys]
+        for a in sorted(buys, key=lambda x: x["score"], reverse=True):
+            lines.append(f"  {a['ticker']} — {a['verdict']} (score: {a['score']:+d})")
         lines.append("")
     if sells:
         lines.append("<b>🔴 Señales de Venta:</b>")
-        lines += [f"  {a['ticker']} — {a['verdict']} (score: {a['score']:+d})" for a in sells]
+        for a in sorted(sells, key=lambda x: x["score"]):
+            lines.append(f"  {a['ticker']} — {a['verdict']} (score: {a['score']:+d})")
         lines.append("")
     if neutral:
         lines.append(f"<b>⚪ Neutral:</b> {', '.join(a['ticker'] for a in neutral)}")
@@ -178,25 +192,30 @@ def main():
     tickers  = cfg["tickers"]
     date_str = datetime.now().strftime("%d/%m/%Y")
 
-    print(f"\n🤖 Scanner | {date_str} | Tickers: {', '.join(tickers)}\n")
+    print(f"\n🤖 Scanner de Señales | {date_str}")
+    print(f"   Tickers: {', '.join(tickers)}")
+    print(f"   Chat ID configurado: {'SI' if tg_chat else 'NO'}\n")
+
     analyses = []
 
     for ticker in tickers:
-        print(f"  {ticker}...", end=" ", flush=True)
+        print(f"\n  Analizando {ticker}...")
         try:
-            df       = add_indicators(fetch_data(ticker), p)
+            df       = fetch_data(ticker)
+            df       = add_indicators(df, p)
             analysis = analyze_ticker(ticker, df, p)
             analyses.append(analysis)
             send_telegram(tg_token, tg_chat, format_message(analysis, date_str))
-            print(analysis["verdict"])
+            print(f"  {ticker}: {analysis['verdict']}")
         except Exception as e:
-            print(f"❌ {e}")
+            print(f"  ❌ {ticker} Error: {e}")
 
     if len(analyses) > 1:
         send_telegram(tg_token, tg_chat, format_summary(analyses, date_str))
-        print("\n✅ Resumen enviado a Telegram")
+        print(f"\n  → Resumen enviado a Telegram")
 
     print("\n✅ Scanner finalizado.\n")
+
 
 if __name__ == "__main__":
     main()
