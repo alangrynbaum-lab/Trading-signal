@@ -1,5 +1,5 @@
 {
-"tickers": ["SPY", "GLD", "ARKW", "VGT", "XLE", "SCHD", "MSTR", "BTC-USD"],
+"tickers": ["SPY", "GLD", "ARKW", "VGT", "XLE", "SCHD", "MSTR", "BTC-USD", "ARGT"]
   "timeframe": "1d",
   "lookback_days": 365,
   "telegram": {
