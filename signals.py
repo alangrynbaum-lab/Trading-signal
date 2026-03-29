@@ -1,5 +1,6 @@
 """
 Scanner de Señales en Vivo — Trading Bot
+Fuente de datos: Alpha Vantage API
 Corre diariamente via GitHub Actions y manda alertas a Telegram.
 """
 
@@ -12,14 +13,13 @@ from datetime import datetime
 import pandas as pd
 import ta
 import requests
-import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# Simular browser para evitar bloqueos de Yahoo Finance en CI
-yf.utils.user_agent_headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
+ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query"
+
+# Mapeo de tickers crypto para Alpha Vantage
+CRYPTO_TICKERS = {"BTC-USD": ("BTC", "USD")}
 
 
 def load_config(path: str = "config.json") -> dict:
@@ -38,30 +38,79 @@ def send_telegram(token: str, chat_id: str, message: str):
         print(f"  ⚠️  Telegram error: {e}")
 
 
-def fetch_data(ticker: str, retries: int = 3) -> pd.DataFrame:
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+def fetch_stock(ticker: str, api_key: str) -> pd.DataFrame:
+    """Descarga datos diarios de una acción/ETF via Alpha Vantage."""
+    params = {
+        "function": "TIME_SERIES_DAILY",
+        "symbol": ticker,
+        "outputsize": "compact",  # últimos 100 días
+        "apikey": api_key,
     }
-    session = requests.Session()
-    session.headers.update(headers)
+    r = requests.get(ALPHA_VANTAGE_BASE, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
 
-    for attempt in range(retries):
-        try:
-            time.sleep(3 + attempt * 2)
-            tk = yf.Ticker(ticker, session=session)
-            df = tk.history(period="120d", interval="1d", auto_adjust=True)
-            if df.empty:
-                raise ValueError(f"DataFrame vacío para {ticker}")
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            print(f"    ✓ {len(df)} filas descargadas")
-            return df
-        except Exception as e:
-            print(f"    Intento {attempt+1}/{retries} fallido: {e}")
-            if attempt < retries - 1:
-                time.sleep(10)
-    raise ValueError(f"No se pudo obtener datos para {ticker}")
+    if "Time Series (Daily)" not in data:
+        msg = data.get("Note") or data.get("Information") or str(data)
+        raise ValueError(f"Alpha Vantage error para {ticker}: {msg}")
+
+    ts = data["Time Series (Daily)"]
+    df = pd.DataFrame.from_dict(ts, orient="index")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df = df.rename(columns={
+        "1. open": "Open", "2. high": "High",
+        "3. low": "Low",   "4. close": "Close",
+        "5. volume": "Volume"
+    })
+    df = df.astype(float)
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+
+def fetch_crypto(symbol: str, market: str, api_key: str) -> pd.DataFrame:
+    """Descarga datos diarios de crypto via Alpha Vantage."""
+    params = {
+        "function": "DIGITAL_CURRENCY_DAILY",
+        "symbol": symbol,
+        "market": market,
+        "apikey": api_key,
+    }
+    r = requests.get(ALPHA_VANTAGE_BASE, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    key = "Time Series (Digital Currency Daily)"
+    if key not in data:
+        msg = data.get("Note") or data.get("Information") or str(data)
+        raise ValueError(f"Alpha Vantage crypto error: {msg}")
+
+    ts = data[key]
+    df = pd.DataFrame.from_dict(ts, orient="index")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df = df.rename(columns={
+        "1. open":   "Open",
+        "2. high":   "High",
+        "3. low":    "Low",
+        "4. close":  "Close",
+        "5. volume": "Volume",
+    })
+    df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float).dropna()
+    return df
+
+
+def fetch_data(ticker: str, api_key: str) -> pd.DataFrame:
+    """Router: detecta si es crypto o acción y llama la función correcta."""
+    time.sleep(12)  # Alpha Vantage free tier: max 5 requests/min
+
+    if ticker in CRYPTO_TICKERS:
+        symbol, market = CRYPTO_TICKERS[ticker]
+        df = fetch_crypto(symbol, market, api_key)
+    else:
+        df = fetch_stock(ticker, api_key)
+
+    print(f"    ✓ {len(df)} días descargados")
+    return df.tail(120)  # últimos 120 días
 
 
 def add_indicators(df: pd.DataFrame, p: dict) -> pd.DataFrame:
@@ -87,14 +136,12 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, p: dict) -> dict:
     signals = []
     score   = 0
 
-    ema_cross_up   = last["ema_fast"] > last["ema_slow"] and prev["ema_fast"] <= prev["ema_slow"]
-    ema_cross_down = last["ema_fast"] < last["ema_slow"] and prev["ema_fast"] >= prev["ema_slow"]
-    ema_bull       = last["ema_fast"] > last["ema_slow"]
+    ema_bull = last["ema_fast"] > last["ema_slow"]
 
-    if ema_cross_up:
+    if last["ema_fast"] > last["ema_slow"] and prev["ema_fast"] <= prev["ema_slow"]:
         signals.append("📈 EMA20 cruzó arriba EMA50 (Bullish crossover)")
         score += 2
-    elif ema_cross_down:
+    elif last["ema_fast"] < last["ema_slow"] and prev["ema_fast"] >= prev["ema_slow"]:
         signals.append("📉 EMA20 cruzó abajo EMA50 (Bearish crossover)")
         score -= 2
     elif ema_bull:
@@ -197,19 +244,25 @@ def main():
     p        = cfg["strategy_params"]
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN") or cfg["telegram"]["bot_token"]
     tg_chat  = os.environ.get("TELEGRAM_CHAT_ID")   or cfg["telegram"]["chat_id"]
+    av_key   = os.environ.get("ALPHA_VANTAGE_KEY")  or cfg.get("alpha_vantage_key", "")
     tickers  = cfg["tickers"]
     date_str = datetime.now().strftime("%d/%m/%Y")
 
     print(f"\n🤖 Scanner de Señales | {date_str}")
     print(f"   Tickers: {', '.join(tickers)}")
-    print(f"   Chat ID configurado: {'SI' if tg_chat else 'NO'}\n")
+    print(f"   Alpha Vantage: {'OK' if av_key else 'FALTA KEY'}")
+    print(f"   Telegram: {'OK' if tg_chat else 'FALTA CHAT ID'}\n")
+
+    if not av_key:
+        print("❌ ALPHA_VANTAGE_KEY no configurado. Abortando.")
+        return
 
     analyses = []
 
     for ticker in tickers:
         print(f"\n  Analizando {ticker}...")
         try:
-            df       = fetch_data(ticker)
+            df       = fetch_data(ticker, av_key)
             df       = add_indicators(df, p)
             analysis = analyze_ticker(ticker, df, p)
             analyses.append(analysis)
